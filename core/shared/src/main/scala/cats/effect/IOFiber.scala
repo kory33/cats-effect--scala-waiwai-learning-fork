@@ -83,43 +83,89 @@ private final class IOFiber[A](
   import IOFiberConstants._
   import TracingConstants._
 
+  // List[{ type V; key: IOLocal[V]; actual: V }] から生成したような Map[IOLocal[?], ?]
+  // 「各 K/V pair の間で型が合ってる」ような Map (Map を使う限り型システムに載らない情報なので、こういう型になってる)
+  // windy: [A] =>> Map[IOLocal[A], A]
+  // ↑ではなかった。↑の例だと全部のペアでAに大統一されてしまう
   private[this] var localState: IOLocalState = initState
+
+  // 今 Fiber が実行に使っている ExecutionContext (最初は startEC)
   private[this] var currentCtx: ExecutionContext = startEC
-  private[this] val objectState: ArrayStack[AnyRef] = ArrayStack()
-  private[this] val finalizers: ArrayStack[IO[Unit]] = ArrayStack()
-  private[this] val callbacks: CallbackStack[OutcomeIO[A]] = CallbackStack.of(cb)
-  private[this] var resumeTag: Byte = ExecR
-  private[this] var resumeIO: IO[Any] = startIO
-  private[this] val runtime: IORuntime = rt
-  private[this] val tracingEvents: RingBuffer =
-    if (TracingConstants.isStackTracing) RingBuffer.empty(runtime.traceBufferLogSize) else null
 
   /*
    * Ideally these would be on the stack, but they can't because we sometimes need to
    * relocate our runloop to another fiber.
    */
-  private[this] var conts: ByteStack.T = _
 
+  // conts と objectState + finalizers は結託して継続を保存している
+  private[this] var conts: ByteStack.T = _
+  // objectState は継続の引数を保存している
+  private[this] val objectState: ArrayStack[AnyRef] = ArrayStack()
+  // OnCancel 時に finalizer を積む場所
+  // 「今、もしこの瞬間にキャンセルされたら、どの finalizer を (どの順番で) 実行しないといけなかったのか」を保存している
+  // 実際にキャンセルされた時には、この Stack の上から順に finalizer を実行していく
+  private[this] val finalizers: ArrayStack[IO[Unit]] = ArrayStack()
+
+  // Fiber が終了したときに呼ぶべきコールバックを覚えておく場所
+  // _join (この Fiber を外側から見ている観測者にとっては、「終わったら通知してくれ」というリクエスト) を完了させるために使う
+  // windy: フードコートで渡される鳴るやつを思い出した
+  private[this] val callbacks: CallbackStack[OutcomeIO[A]] = CallbackStack.of(cb)
+
+  // Fiber が前回の run (「飽きるまで走ったとき」)の最後に何をしていたかを記録する 1 Byte
+  private[this] var resumeTag: Byte = ExecR
+
+  // Fiber が前回の run の最後に何を _cur0 の余剰として遺したのかを記録する
+  private[this] var resumeIO: IO[Any] = startIO
+
+  // Work-stealing thread pool と blocking (unbounded) thread pool の組とか、どれぐらいの頻度で「飽きる」のかとかの、
+  // Fiber のいわゆる設定情報
+  private[this] val runtime: IORuntime = rt
+
+  // Tracing 機能を実現するための、trace を入れたリングバッファ (デフォルトで size = 16; IORuntimeConfig.DefaultTraceBufferSize)
+  // なぜ stack じゃなくて ringbuffer なのか、というと、例えば tailRecM とかで「意味的には」コールスタックをどんどん深めていくような場合でも
+  // メモリを無限に食われると困るので、過去 (tailRecM をするよりも前) のトレースを犠牲にしてでもメモリ使用量を抑えるため
+  private[this] val tracingEvents: RingBuffer =
+    if (TracingConstants.isStackTracing) RingBuffer.empty(runtime.traceBufferLogSize) else null
+
+  // 自分はキャンセルされたか？
   private[this] var canceled: Boolean = false
+
+  // Uncancelable がいくつ重なっているか？
   private[this] var masks: Int = 0
+
+  // 終了処理の真っ只中か？
+  // windy: 「もう閉店なんで・・・」する
   private[this] var finalizing: Boolean = false
 
+  // この Fiber の最終結果で、最初は null
   @volatile
   private[this] var outcome: OutcomeIO[A] = _
 
+  // 一スレッド上で「飽きる」、もしくは「手を止める要請をされる (EvalOn など)」まで CEK 機械的にやり残したことをやり続ける
+  // CEK 機械についてはこちらをどうぞ
+  //   https://scrapbox.io/scala-waiwai/fs2.Pull%23compile_%E5%8B%89%E5%BC%B7%E4%BC%9A_%E3%81%9D%E3%81%AE3
   override def run(): Unit = {
     // insert a read barrier after every async boundary
     readBarrier()
-    (resumeTag: @switch) match {
+    (resumeTag: @switch /* tableswitch 生成を保証するアノテーション */ ) match {
+      // ExecR: 「前回」が無い状態 (FiberIO#run が最初に実行されるまでしか使われない)
       case 0 => execR()
+      // AsyncContinueSuccessfulR:
       case 1 => asyncContinueSuccessfulR()
+      // AsyncContinueFailedR:
       case 2 => asyncContinueFailedR()
+      // AsyncContinueCanceledR:
       case 3 => asyncContinueCanceledR()
+      // AsyncContinueCanceledWithFinalizerR:
       case 4 => asyncContinueCanceledWithFinalizerR()
+      // BlockingR:
       case 5 => blockingR()
+      // CedeR: 「前回」の最後に Cede によって Fiber の実行が止まりリスケジューリングされた
       case 6 => cedeR()
+      // AutoCedeR: 「前回」の最後に Fiber 自身が「飽きた」、もしくは、EvalOn によって ExecutionContext が変わった
       case 7 => autoCedeR()
-      case 8 => () // DoneR
+      // DoneR: 「この Fiber はもう終わりました」 (run メソッドはもうなにもしなくてよい)
+      case 8 => ()
     }
   }
 
@@ -195,6 +241,7 @@ private final class IOFiber[A](
   /* masks encoding: initMask => no masks, ++ => push, -- => pop */
   @tailrec
   private[this] def runLoop(
+      // 「まな板の上に置かれた」プログラム
       _cur0: IO[Any],
       cancelationIterations: Int,
       autoCedeIterations: Int): Unit = {
@@ -207,8 +254,9 @@ private final class IOFiber[A](
       return
     }
 
-    var nextCancelation = cancelationIterations - 1
-    var nextAutoCede = autoCedeIterations
+    var nextCancelation =
+      cancelationIterations - 1 // あと何回したら readBarrier を通ってキャンセルを観測しにいかないといけないか
+    var nextAutoCede = autoCedeIterations // あと何回したら「自分は飽きました」となるのか (にだいたい等しい数)
     if (nextCancelation <= 0) {
       // Ensure that we see cancelation.
       readBarrier()
@@ -217,14 +265,19 @@ private final class IOFiber[A](
       nextAutoCede -= nextCancelation
 
       if (nextAutoCede <= 0) {
+        // Fiber が「飽きる」瞬間が来た
+        // _cur0 をそのままやり残しているので、resumeIO に入れておいて、
+        // 「自分は前回飽きました」というのを覚えておくために resumeTag に AutoCedeR を入れておく
         resumeTag = AutoCedeR
         resumeIO = _cur0
         val ec = currentCtx
         rescheduleFiber(ec, this)
-        return
+        return // run() 自体を終了する。reschedule 済みなので OK
       }
     }
 
+    // ここで「自分はキャンセルされたんだっけ？」というのを見る
+    // readBarrier を通して他スレッドからのキャンセルを観測するのが数回おき (IO.Canceled とか)
     if (shouldFinalize()) {
       val fin = prepareFiberForCancelation(null)
       runLoop(fin, nextCancelation, nextAutoCede)
@@ -243,6 +296,7 @@ private final class IOFiber[A](
        */
       (cur0.tag: @switch) match {
         case 0 =>
+          // CEK 機械で言うところの、クロージャが値になってしまったので継続側を取り出さないといけないとき
           val cur = cur0.asInstanceOf[Pure[Any]]
           runLoop(succeeded(cur.value, 0), nextCancelation, nextAutoCede)
 
@@ -870,6 +924,8 @@ private final class IOFiber[A](
 
         /* Cede */
         case 16 =>
+          // CEK 機械で言うところの Closure 側を評価しきったような状況に近い
+          // ここでやり残したことはないので、 resumeIO には何もセットせず、そのまま進む
           resumeTag = CedeR
           rescheduleFiber(currentCtx, this)
 
@@ -1196,10 +1252,15 @@ private final class IOFiber[A](
     callbacks.unsafeSetCallback(cb)
   }
 
+  // CEK 機械の動作原理に
+  //  > 「まな板の上に置かれた」クロージャが値になっていたら (それ以上評価できなくなっていたら)、
+  //  > 継続の一番最初の部分を切り崩し、値を用いて「次に評価しなければならないクロージャ」を作る
+  // というのがあったと思うが、それと同じことをやる。
+  // つまり、(成功ケースの) result を継続の最初の方に渡して、次に評価しないといけない cur0 に相当するものを作る
   @tailrec
   private[this] def succeeded(result: Any, depth: Int): IO[Any] =
     (ByteStack.pop(conts): @switch) match {
-      case 0 => // mapK
+      case 0 => // mapK (IO.map(##, f))
         val f = objectState.pop().asInstanceOf[Any => Any]
 
         var error: Throwable = null
@@ -1214,16 +1275,26 @@ private final class IOFiber[A](
           }
 
         if (depth > MaxStackDepth) {
+          // map のチェイン (などの即座に切り崩せる継続構造) を 512 個処理したので、一旦 runLoop に制御を戻すため、IO.Pure で戻る
           if (error == null) IO.Pure(transformed)
+          // 一番最後の切り崩し処理でエラーになった場合には IO.Error で runLoop に戻る
           else IO.Error(error)
         } else {
+          // 継続スタック (cont) の上の方が IO.map(##, f1) :: IO.map(##, f2) :: IO.map(##, f3) ... みたいになっている時、
+          // result を f1 |> f2 |> f3 |> ... のように流していった方が速いので、tailrec する (depth が MaxStackDepth (=512) に達したら止める)
           if (error == null) succeeded(transformed, depth + 1)
+          // attemptK によって depth がまた戻ってくるので、 +1 して渡す
+          // これによって、成功ケースでの継続の切り崩しと、それによるエラー発生、それの unwinding 中の attemptK による成功ケースへの変換
+          //  の間で無限ループにならないことが保証される
           else failed(error, depth + 1)
         }
 
       case 1 => // flatMapK
         val f = objectState.pop().asInstanceOf[Any => IO[Any]]
 
+        // f が実は純粋関数になっていなくて (ユーザーエラーの一種ではあるが)、例外を投げるかもしれないので、
+        // その場合は IO 側で unwind してあげる (えらい)
+        // そうでない場合は、 f に result を入れて出てきた IO をそのまま runLoop のまな板の上に置きなおせばよい
         try f(result)
         catch {
           case t if NonFatal(t) =>
@@ -1231,17 +1302,22 @@ private final class IOFiber[A](
           case t: Throwable =>
             onFatalFailure(t)
         }
+      // windy: Scalaはtry-catchが式でえらいなあ〜
 
       case 2 => cancelationLoopSuccessK()
-      case 3 => runTerminusSuccessK(result)
+      case 3 => runTerminusSuccessK(result) // HALT 継続なので、done を呼び出して終わる
       case 4 => evalOnSuccessK(result)
 
       case 5 => // handleErrorWithK
         // this is probably faster than the pre-scan we do in failed, since handlers are rarer than flatMaps
+        // エラーハンドリングを (objectState の一番上に積まれている関数によって) 行うという継続だったが、成功ケースなので、
+        // そのハンドラは捨ててしまって succeeded の tailRec を続けてよい
         objectState.pop()
         succeeded(result, depth)
 
-      case 6 => // onCancelSuccessK
+      case 6 => // onCancelSuccessK // PR チャンス！これは onCancelK です
+        // キャンセルされたとしたら finalizers の一番上に積まれている処理をやっておいてください、という継続だったんだけど、
+        // 現にキャンセルされていないので、ヨシ (finalizers の一番上は捨ててよい)
         finalizers.pop()
         succeeded(result, depth + 1)
 
@@ -1254,9 +1330,11 @@ private final class IOFiber[A](
         succeeded(result, depth + 1)
 
       case 9 => // attemptK
+        // attemptK は、成功ケースの場合は Left に包んで継続を切り崩し続ける
         succeeded(Right(result), depth)
     }
 
+  // つまり、(失敗ケースの) error を用いて、継続を unwinding する
   private[this] def failed(error: Throwable, depth: Int): IO[Any] = {
     Tracing.augmentThrowable(runtime.enhancedExceptions, error, tracingEvents)
 
@@ -1286,6 +1364,7 @@ private final class IOFiber[A](
       /* (case 0) will never continue to mapK */
       /* (case 1) will never continue to flatMapK */
       case 0 | 1 =>
+        // mapK / flatMapK と共に積まれていたはずの関数はもう要らない (そのプログラムパスを通ることはもうない) ので捨てる
         objectState.pop()
         failed(error, depth)
 
@@ -1373,19 +1452,32 @@ private final class IOFiber[A](
 
   /* Implementations of resume methods */
 
+  // 「前回」が無い状態から実行されるときに runLoop に入るための、初期化を含んだ処理
   private[this] def execR(): Unit = {
     // println(s"$name: starting at ${Thread.currentThread().getName} + ${suspended.get()}")
     if (canceled) {
+      // kory: かわいそう…
+      // windymelt + lemoncmd: canceled のチェックは安い & ここを超えると色々なアロケーションが走るのでやってるのかも
       done(IOFiber.OutcomeCanceled.asInstanceOf[OutcomeIO[A]])
     } else {
       conts = ByteStack.create(16)
+      // コンパイルターゲットによっては grow 処理が必要なので、再代入が要る
+      // 中身をちょっと読んだ感じ、まず class をここで allocate したくない → プラットフォームごとに違う実装型 T を使いたい
+      // これが growable である保証もないので、再代入が必要、という感じっぽい
       conts = ByteStack.push(conts, RunTerminusK)
 
       objectState.init(16)
       finalizers.init(16)
 
+      // val x = ...
+      // ioa.flatMap { _ => ... /* x に言及している */  }
+      //  -> flatMap にわたっているラムダ式は x を capture する
+      //     capture するというのがどういうことかというと、(_ => ...) を表現する (実行時生成される) クラスが
+      //     x を final なフィールドとして持つ
+      //  -> 「ioa.flatMap { _ => ... /* x に言及している */  }」全体が GC できない限り、 x が GC できない
+
       val io = resumeIO
-      resumeIO = null
+      resumeIO = null // GC!
       runLoop(io, runtime.cancelationCheckThreshold, runtime.autoYieldThreshold)
     }
   }
