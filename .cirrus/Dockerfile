@@ -1,3 +1,3 @@
-FROM sbtscala/scala-sbt:eclipse-temurin-jammy-17.0.5_8_1.9.0_3.3.0
+FROM sbtscala/scala-sbt:eclipse-temurin-jammy-22_36_1.10.4_3.5.2
 
 RUN apt-get update && apt-get install -y clang
